@@ -20,16 +20,23 @@ from database import init_db, upsert_client, save_order, update_order_status, ge
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "8871514482:AAGEqOUDPoAeCyyu8gvGa0ZkKRgqV28Yo5A")
-ADMIN_ID    = int(os.getenv("ADMIN_ID") or "624826036")       # ваш личный ID (для сообщений от оператора)
-GROUP_ID           = int(os.getenv("GROUP_ID") or "-5211502458")      # группа сотрудников (заявки)
-GROUP_ID_ZARAFSHAN = int(os.getenv("GROUP_ID_ZARAFSHAN") or "0")        # группа Зарафшан
-GROUP_ID_NAVOI     = int(os.getenv("GROUP_ID_NAVOI") or "0")            # группа Навои
-GROUP_SMS_ID           = int(os.getenv("GROUP_SMS_ID") or "-5303335722")    # группа сообщений от клиентов
-GROUP_NEW_CLIENTS_ID   = int(os.getenv("GROUP_NEW_CLIENTS_ID") or "0")        # группа новых клиентов
-SHEETS_URL  = os.getenv("SHEETS_URL", "https://script.google.com/macros/s/AKfycbyU5a3pMuTFme3dBNEgu46qzA1sN1Ekw-Q7p39F1Pg872lnnXZEFhJPjuc4TzZNHlpObQ/exec")
+BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
+ADMIN_ID    = int(os.getenv("ADMIN_ID") or "0")
+GROUP_ID    = int(os.getenv("GROUP_ID") or "0")          # общая группа (fallback)
+GROUP_SMS_ID         = int(os.getenv("GROUP_SMS_ID") or "0")
+GROUP_NEW_CLIENTS_ID = int(os.getenv("GROUP_NEW_CLIENTS_ID") or "0")
+SHEETS_URL  = os.getenv("SHEETS_URL", "")
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://artez.uz")
-API_URL     = os.getenv("API_URL", "https://artez-api-production.up.railway.app/api")
+API_URL     = os.getenv("API_URL", "")
+
+# ── SaaS: идентификатор компании ─────────────────────────────────────────
+# Устанавливается в Railway env при деплое для каждой компании отдельно.
+COMPANY_ID  = int(os.getenv("COMPANY_ID", "1"))
+
+# ── Динамические данные филиалов (загружаются при старте из БД) ───────────
+# Структура: [{"slug": "zarafshan", "name_ru": "Зарафшан",
+#              "tg_delivery_group_id": -100..., "phones": [...], ...}, ...]
+BRANCHES: list[dict] = []
 
 # Настройки сайта — загружаются при старте из API, используются во всех сообщениях
 SITE = {
@@ -43,6 +50,20 @@ SITE = {
     "social_tg_bot":      "https://t.me/artez_orders_bot",
     "social_instagram":   "https://www.instagram.com/ziyoboboev/",
 }
+
+async def load_branches():
+    """Загружает список филиалов компании из БД и кеширует в BRANCHES."""
+    global BRANCHES
+    try:
+        rows = await db.get_branches(COMPANY_ID)
+        if rows:
+            BRANCHES = [dict(r) for r in rows]
+            logging.info(f"✅ Branches loaded: {[b.get('slug') for b in BRANCHES]}")
+        else:
+            logging.warning("⚠️ No branches found for COMPANY_ID=%s", COMPANY_ID)
+    except Exception as e:
+        logging.warning(f"load_branches error: {e}")
+
 
 async def load_site_settings():
     try:
@@ -60,75 +81,87 @@ async def load_site_settings():
         logging.warning(f"Could not load site settings: {e}")
 
 def _rebuild_dynamic_texts():
-    """Обновляет строки в TEXTS которые содержат номера телефонов и ссылки."""
-    sh  = SITE["contact_short"]
-    mn  = SITE["contact_main"]
-    z1  = SITE["contact_zarafshan_1"]
-    z2  = SITE["contact_zarafshan_2"]
-    n1  = SITE["contact_navoi_1"]
-    n2  = SITE["contact_navoi_2"]
-    tg  = SITE["social_tg_group"]
-    ins = SITE["social_instagram"]
+    """Обновляет строки в TEXTS на основе SITE и динамических данных BRANCHES."""
+    sh  = SITE.get("contact_short", "")
+    mn  = SITE.get("contact_main", "")
+    company_name = SITE.get("company_name", "")
+    website = WEBSITE_URL
+
+    # Строка контактов для меню — из динамических филиалов
+    branches_ru = "\n\n".join(
+        f"*{b.get('name_ru', b.get('slug',''))}*\n" +
+        "\n".join(f"📱 {p}" for p in (b.get("phones") or []))
+        for b in BRANCHES if b.get("phones")
+    )
+    branches_uz = "\n\n".join(
+        f"*{b.get('name_uz', b.get('slug',''))}*\n" +
+        "\n".join(f"📱 {p}" for p in (b.get("phones") or []))
+        for b in BRANCHES if b.get("phones")
+    )
 
     TEXTS["ru"]["menu_title"] = (
-        f"🏠 Главное меню\n\nООО «ARTEZ» — профессиональная чистка ковров\n"
-        f"📍 Зарафшан и Навои\n🌐 [artez.uz](https://artez.uz)\n\n"
-        f"☎️ Короткий номер: {sh}\n📞 Оператор:\n{mn}\n\n"
-        f"*г. Зарафшан*\n📱 {z1}\n📱 {z2}\n\n"
-        f"*г. Навои*\n📱 {n1}\n📱 {n2}"
+        f"🏠 Главное меню\n\n{company_name}\n"
+        f"🌐 [{website}]({website})\n\n"
+        f"{'☎️ Короткий номер: ' + sh + chr(10) if sh else ''}"
+        f"{'📞 Оператор: ' + mn + chr(10) if mn else ''}"
+        + (f"\n{branches_ru}" if branches_ru else "")
     )
     TEXTS["uz"]["menu_title"] = (
-        f"🏠 Asosiy menyu\n\nARTEZ MChJ — professional gilam tozalash\n"
-        f"📍 Zarafshon va Navoiy\n🌐 [artez.uz](https://artez.uz)\n\n"
-        f"☎️ Qisqa raqam: {sh}\n📞 Operator:\n{mn}\n\n"
-        f"*Zarafshon shahri*\n📱 {z1}\n📱 {z2}\n\n"
-        f"*Navoiy shahri*\n📱 {n1}\n📱 {n2}"
+        f"🏠 Asosiy menyu\n\n{company_name}\n"
+        f"🌐 [{website}]({website})\n\n"
+        f"{'☎️ Qisqa raqam: ' + sh + chr(10) if sh else ''}"
+        f"{'📞 Operator: ' + mn + chr(10) if mn else ''}"
+        + (f"\n{branches_uz}" if branches_uz else "")
     )
     TEXTS["ru"]["order_done"] = (
         f"✅ *Заявка принята!*\n\nМы перезвоним вам в течение 30 минут.\n\n"
         f"Номер заявки: *#{{num}}*\n\n"
-        f"☎️ Короткий номер: *{sh}*\n📞 {mn}"
+        f"{'☎️ Короткий номер: *' + sh + '*' + chr(10) if sh else ''}"
+        f"{'📞 ' + mn if mn else ''}"
         f"{{branch_phones}}"
     )
     TEXTS["uz"]["order_done"] = (
         f"✅ *Ariza qabul qilindi!*\n\n30 daqiqa ichida qayta qo'ng'iroq qilamiz.\n\n"
         f"Ariza raqami: *#{{num}}*\n\n"
-        f"☎️ Qisqa raqam: *{sh}*\n📞 {mn}"
+        f"{'☎️ Qisqa raqam: *' + sh + '*' + chr(10) if sh else ''}"
+        f"{'📞 ' + mn if mn else ''}"
         f"{{branch_phones}}"
     )
     TEXTS["ru"]["quick_done"] = (
         f"✅ *Заявка принята!*\n\nМы свяжемся с вами в ближайшее время.\n\n"
-        f"☎️ Короткий номер: *{sh}*\n📞 {mn}"
+        f"{'☎️ Короткий номер: *' + sh + '*' + chr(10) if sh else ''}"
+        f"{'📞 ' + mn if mn else ''}"
         f"{{branch_phones}}"
     )
     TEXTS["uz"]["quick_done"] = (
         f"✅ *Ariza qabul qilindi!*\n\nTez orada siz bilan bog'lanamiz.\n\n"
-        f"☎️ Qisqa raqam: *{sh}*\n📞 {mn}"
+        f"{'☎️ Qisqa raqam: *' + sh + '*' + chr(10) if sh else ''}"
+        f"{'📞 ' + mn if mn else ''}"
         f"{{branch_phones}}"
     )
     TEXTS["ru"]["order_rejected"] = (
         f"❌ К сожалению, заявка *{{num}}* не может быть выполнена.\n\n"
-        f"Позвоните нам:\n☎️ {sh}\n📞 {mn}"
+        f"Позвоните нам:\n"
+        f"{'☎️ ' + sh + chr(10) if sh else ''}{'📞 ' + mn if mn else ''}"
     )
     TEXTS["uz"]["order_rejected"] = (
         f"❌ Afsuski, *{{num}}* arizasi bajarilishi mumkin emas.\n\n"
-        f"Bizga qo'ng'iroq qiling:\n☎️ {sh}\n📞 {mn}"
+        f"Bizga qo'ng'iroq qiling:\n"
+        f"{'☎️ ' + sh + chr(10) if sh else ''}{'📞 ' + mn if mn else ''}"
     )
-    TEXTS["ru"]["branches_text"] = (
-        f"📍 *Наши филиалы*\n\n"
-        f"🏢 *Филиал Зарафшан*\nОбслуживает: Зарафшан, Учкудук, Тамдинский район\n"
-        f"📞 {sh}\n📱 {mn}\n📱 {z1}\n📱 {z2}\n\n"
-        f"🏢 *Филиал Навои*\nОбслуживает: Навои и все остальные районы области\n"
-        f"📞 {sh}\n📱 {mn}\n📱 {n1}\n📱 {n2}"
-    )
-    TEXTS["uz"]["branches_text"] = (
-        f"📍 *Filiallarimiz*\n\n"
-        f"🏢 *Zarafshon filiali*\nXizmat ko'rsatadi: Zarafshon, Uchquduq, Tomdi tumani\n"
-        f"📞 {sh}\n📱 {mn}\n📱 {z1}\n📱 {z2}\n\n"
-        f"🏢 *Navoiy filiali*\nXizmat ko'rsatadi: Navoiy va viloyatning boshqa tumanlari\n"
-        f"📞 {sh}\n📱 {mn}\n📱 {n1}\n📱 {n2}"
-    )
-    # Telegram и Instagram кнопки обновляются через promo_kb — ссылки в SITE
+    # Текст "Наши филиалы" — динамически из BRANCHES
+    branches_detail_ru = "\n\n".join(
+        f"🏢 *{b.get('name_ru', b.get('slug',''))}*\n" +
+        "\n".join(f"📱 {p}" for p in (b.get("phones") or []))
+        for b in BRANCHES
+    ) or "Информация о филиалах недоступна"
+    branches_detail_uz = "\n\n".join(
+        f"🏢 *{b.get('name_uz', b.get('name_ru', b.get('slug','')))}*\n" +
+        "\n".join(f"📱 {p}" for p in (b.get("phones") or []))
+        for b in BRANCHES
+    ) or "Filiallar haqida ma'lumot mavjud emas"
+    TEXTS["ru"]["branches_text"] = f"📍 *Наши филиалы*\n\n{branches_detail_ru}"
+    TEXTS["uz"]["branches_text"] = f"📍 *Filiallarimiz*\n\n{branches_detail_uz}"
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
@@ -871,11 +904,12 @@ async def send_to_sheets(data: dict):
         logging.warning(f"Sheets error: {e}")
 
 def _group_id_for_branch(branch: str) -> int:
-    """Возвращает chat_id группы по филиалу. Fallback — общий GROUP_ID."""
-    if branch == "zarafshan" and GROUP_ID_ZARAFSHAN:
-        return GROUP_ID_ZARAFSHAN
-    if branch == "navoi" and GROUP_ID_NAVOI:
-        return GROUP_ID_NAVOI
+    """Возвращает tg_orders_group_id филиала из BRANCHES. Fallback — GROUP_ID."""
+    for b in BRANCHES:
+        if b.get("slug") == branch:
+            gid = b.get("tg_orders_channel_id") or b.get("tg_delivery_group_id")
+            if gid:
+                return int(gid)
     return GROUP_ID
 
 async def _notify_new_bot_client(uid: int, first_name: str, last_name: str, phone: str, username: str):
@@ -4160,12 +4194,13 @@ async def safe_reject_cb(cb: CallbackQuery):
 
 # ── ЗАПУСК ──
 async def main():
-    logging.info("🚀 ARTEZ Bot starting...")
+    logging.info(f"🚀 Bot starting (COMPANY_ID={COMPANY_ID})...")
     await init_db()
+    await load_branches()      # загружаем филиалы до текстов
     await load_prices()
     await load_units()
     await load_services()
-    await load_site_settings()
+    await load_site_settings() # _rebuild_dynamic_texts() вызывается внутри
     # Удаляем webhook если был установлен (artez_api мог его поставить)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
